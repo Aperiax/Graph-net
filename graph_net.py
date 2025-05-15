@@ -213,7 +213,7 @@ class LSTMDecoder(nn.Module):
             else:
                 # Update LSTM state
                 h, c = self.lstm(inp, (h, c))
-                
+                #tralalal 
                 # Attention mechanism
                 query = h.unsqueeze(1)  # [B, 1, D]
                 keys = self.attn(node_emb)  # [B, N, D]
