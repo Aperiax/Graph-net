@@ -11,10 +11,10 @@ def main():
     # Parameters
     num_samples = 100
     min_nodes = 10      
-    max_nodes = 10  
+    max_nodes = 40  
     
-    batch_size = 64 
-    num_epochs = 1      
+    batch_size = 8 
+    num_epochs = 10      
     steps_per_epoch = 1000
     lr = 1e-5
     
@@ -26,7 +26,7 @@ def main():
     print("Creating model...")
 
     model = GraphResNet(
-        hidden_dims=[64,128,256,512], 
+        hidden_dims=[64], 
         init_channels=8, 
         heads=16, 
         dropout=0., 

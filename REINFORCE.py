@@ -85,8 +85,14 @@ class REINFORCE:
             # Check if the tour visited all nodes
             if unique_nodes < all_nodes:
                 # Heavily penalize incomplete tours
-                total_distance *= 1.5
-            
+                total_distance += 100000 * (all_nodes - unique_nodes)
+
+            # so now what I'd like to implemetn is this - boolean flag returns for these occasions:             
+            # all nodes visited 
+            # benefitial revisits 
+            # if either is true, then I'll give it a nice ol' reward 
+
+
             tour_lengths[b] = total_distance
     
         return tour_lengths
@@ -94,16 +100,6 @@ class REINFORCE:
     def _sample_solution(self, model, batch_data, greedy=False):
         """
         Sample a solution from the model
-        
-        Args:
-            model: Model to sample from
-            batch_data: Batch of data
-            greedy: If True, use greedy decoding instead of sampling
-            
-        Returns:
-            tours: Tensor of shape [batch_size, num_nodes] containing node indices
-            log_probs: Tensor of shape [batch_size, num_nodes] containing log probabilities
-                       (None if greedy=True)
         """
         if greedy:
             return model(batch_data, greedy=greedy)    
@@ -115,13 +111,6 @@ class REINFORCE:
     def _paired_t_test(self, current_model_lengths, baseline_model_lengths):
         """
         Perform a one-sided paired t-test to check if current model is significantly better
-        
-        Args:
-            current_model_lengths: Tour lengths from current model's greedy decoding
-            baseline_model_lengths: Tour lengths from baseline model's greedy decoding
-            
-        Returns:
-            True if current model is significantly better, False otherwise
         """
         _, p_value = stats.ttest_rel(
             baseline_model_lengths.cpu().numpy(),
