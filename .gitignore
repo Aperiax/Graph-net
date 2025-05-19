@@ -2,5 +2,5 @@
 *.pt
 last_ditch_effort.py
 *.md
-/__pychache__
+/__pychache__/
 /master
