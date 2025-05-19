@@ -30,7 +30,7 @@ class SkipConnection(nn.Module):
 
 class GATBlock(nn.Module): 
     """
-    Simplified GAT block
+    A block with GATv2conv and residual connection 
     """
     def __init__(
             self, 
@@ -59,13 +59,11 @@ class GATBlock(nn.Module):
         x, edge_index, edge_attr, batch = batch_data
         x_orig = x
 
-        # Simple GAT forward pass
         x, attn = self.gat(x, edge_index, edge_attr, return_attention_weights=True)
         x = F.relu(x)
         
         # Add residual connection
         res = self.residual(x_orig)
-        # this really doesn't need to change 
         x = x  + res
 
         return x, edge_index, edge_attr, attn, batch
@@ -94,7 +92,7 @@ class ParallelHeadFusion(nn.Module):
                 # append several blocks
                 nn.Sequential(
                 GATBlock(in_channels, out_channels_init, dropout=dropout, heads=heads_per_GAT),
-                # this linear is going to project everything into 
+                # this linear is going to project everything into a common dimension
                 nn.Linear(in_features=out_channels_init, out_features=self.final_channels)
                 )
             )
@@ -130,23 +128,24 @@ class ParallelHeadFusion(nn.Module):
 
 class EncodeArray(nn.Module): 
     """
-    Simplified encoder
+    processes the outputs from ParalelHEadFusion and returns them
     """
     def __init__(
             self, 
             init_channels: int, 
             hidden_dim_list: list[int],
             dropout:float=0.,
-            heads:int=4
+            heads:int=4,
+            fixed_nodes:int=20
             ): 
         super().__init__()
 
         self.init_channels = init_channels 
         self.dropout = dropout
         self.heads = heads
+        self.fixed_nodes = fixed_nodes
         
-        # Create a simple sequential stack of fusion blocks
-        # okay, this is a very stupid legacy code, but it's gonna stay, because reasons
+        # Keep ParallelHeadFusion blocks
         self.blocks = nn.ModuleList()
         in_dims = self.init_channels
         for dim in hidden_dim_list:
@@ -158,7 +157,7 @@ class EncodeArray(nn.Module):
             ))
             in_dims = dim 
         
-        self.final_dim = 512 # THIS IS HARDCODED, NOT DYNAMIC, IT WILL BREAK THINGS IF YOU CHANGE THE ARCHITECTURE
+        self.final_dim = 512
 
     def forward(self, batch_data): 
         data_list = [
@@ -168,174 +167,270 @@ class EncodeArray(nn.Module):
         batch_obj = Batch.from_data_list(data_list)
         x, edge_idx, edge_attr, batch = batch_obj.x, batch_obj.edge_index, batch_obj.edge_attr, batch_obj.batch
         
-        # this is fine, since there's going to be only one block - paralel head fusion
-        # but that fusion has several heads working in tandem, already automatically fusing shit
         attn = None
         for block in self.blocks:
             x, edge_idx, edge_attr, attn, batch = block((x, edge_idx, edge_attr, batch))
 
-        # Prepare node embeddings
         B = batch.max().item() + 1
-        node_counts = torch.bincount(batch, minlength=B)
-        # I could technically also make this larger? So that the model has room for revisits
-        N_max = node_counts.max().item()
         
-        # Create padded output and mask
-        padded = torch.zeros(B, N_max, self.final_dim, device=x.device)
-        mask = torch.zeros(B, N_max, dtype=torch.bool, device=x.device)
+        # all graphs have exactly self.fixed_nodes nodes
+        node_emb = torch.zeros(B, self.fixed_nodes, self.final_dim, device=x.device)
         
-        # this has to stay, it prevents things from shitting themseleves due to variable graph sizes
+        # fixed mask (all True for fixed-size graphs), just now noticed that this doesn't really do anything? 
+        # a leftover
+        mask = torch.ones(B, self.fixed_nodes, dtype=torch.bool, device=x.device)
+        
+        # process node embeddings batch by batch
         ptr = 0
-        for i, cnt in enumerate(node_counts):
-            padded[i, :cnt] = x[ptr:ptr+cnt]
-            mask[i, :cnt] = True
-            ptr += cnt
+        for i in range(B):
+            node_count = (batch == i).sum().item()
             
-        return padded, mask, attn  # Empty list for permutations
+            # all graphs should have exactly self.fixed_nodes nodes
+            assert node_count == self.fixed_nodes, f"Expected {self.fixed_nodes} nodes, got {node_count}"
+            
+            node_emb[i] = x[ptr:ptr+self.fixed_nodes]
+            ptr += self.fixed_nodes
+            
+        return node_emb, mask, attn
 
 
 class LSTMDecoder(nn.Module): 
-    def __init__(self, embed_dim): 
+    def __init__(self, embed_dim, fixed_nodes=20): 
         super().__init__()
         self.lstm = nn.LSTMCell(embed_dim, embed_dim)
-        # self attention of the LSTM cell, probably slightly too simplistic
         self.attn = nn.Linear(embed_dim, embed_dim)
         
-        self.enc_attn_wt = nn.Parameter(torch.tensor(0.75)) 
-        self.revisit_penalty = nn.Parameter(torch.tensor(-0.5))
+        self.fixed_nodes = fixed_nodes
+        
+        # attention weights and learnable parameters
+        self.enc_attn_wt = nn.Parameter(torch.tensor(0.5)) 
+        self.revisit_penalty = nn.Parameter(torch.tensor(-0.05))  
         self.shortcut_weight = nn.Parameter(torch.tensor(10.0))
-        self.shortcut_bonus = nn.Parameter(torch.tensor(15.0)) # a huge-ish bonus to for finding a benefitial shortcut
+        self.shortcut_bonus = nn.Parameter(torch.tensor(30.0))  
+        
+        # allow longer tours for shortcut exploration
+        self.exploration_ratio = 1.5
+        
+        # "done" prediction for deciding when to end the tour
+        self.done_predictor = nn.Linear(embed_dim, 1)
 
-        self.allow_exploration = True
-
-
-    def forward(self, node_emb, mask, encoder_attn = None, edge_weights=None, greedy=False):
+    def forward(self, node_emb, mask, encoder_attn=None, edge_weights=None, greedy=False):
         B, N, D = node_emb.size()
         device = node_emb.device
         
-        # Initialize LSTM state
+        # sanity check yanked in after moving away from varialbe sized graphs
+        assert N == self.fixed_nodes, f"Expected {self.fixed_nodes} nodes, got {N}"
+        
+        # calculate maximum steps with exploration buffer
+        max_steps = int(N * self.exploration_ratio)
+        
+        # initialize LSTM state
         h = torch.zeros(B, D, device=device)
         c = torch.zeros(B, D, device=device)
         
-        # Start with mean of node embeddings as input
+        # mean of node embeddings as input
         inp = node_emb.mean(dim=1)
         
-        # Track which nodes have been visited
-        # Important: This tensor will not receive gradients
+        # track which nodes have been visited
         visited_nodes = torch.zeros(B, N, dtype=torch.bool, device=device)
-        
         unique_visited_count = torch.zeros(B, dtype=torch.long, device=device)
         
-        # Store tour indices and log probabilities
+        # track when each batch item's tour is complete
+        tour_complete = torch.zeros(B, dtype=torch.bool, device=device)
+        
+        # store tour indices and log probabilities
         tours = []
         log_probs = []
         
-        # Variables to track first selected node and last selected node
+        # variables to track first selected node and last selected node
         first_node = None
         prev_node = None
-
-        real_nodes_count = torch.sum(mask, dim=1)
         
-        for step in range(N + 1):
-            if step == N:
-                # Last step: return to start node to close the tour
-                curr_node = first_node
+        # dictionary to track planned shortcuts
+        planned_shortcuts = {}
+        
+        for step in range(max_steps + 1):
+            # check if all tours are complete
+            if tour_complete.all():
+                break
+                
+            # force return to start
+            if step == max_steps:
+                curr_node = torch.zeros(B, dtype=torch.long, device=device)
+                for b in range(B):
+                    if not tour_complete[b]:
+                        curr_node[b] = first_node[b]
+                        tour_complete[b] = True
                 curr_log_p = torch.zeros(B, device=device)
             else:
-                # Update LSTM state
+                # update LSTM state
                 h, c = self.lstm(inp, (h, c))
+                
+                # should we complete the tour?
+                for b in range(B):
+                    if not tour_complete[b]:
+                        if unique_visited_count[b] >= N and step >= N:
+                            done_logit = self.done_predictor(h[b:b+1])
+                            done_prob = torch.sigmoid(done_logit)
+                            
+                            if greedy:
+                                should_complete = done_prob > 0.5
+                            else:
+                                should_complete = torch.rand(1, device=device) < done_prob
+                                
+                            if should_complete:
+                                tour_complete[b] = True
                 
                 # Attention mechanism
                 query = h.unsqueeze(1)  # [B, 1, D]
                 keys = self.attn(node_emb)  # [B, N, D]
                 
                 # Calculate attention scores
-                # transformer-like attention
-                scores = torch.bmm(query, keys.transpose(1, 2)).squeeze(1) / (D ** 0.5)  # [B, N] 
+                scores = torch.bmm(query, keys.transpose(1, 2)).squeeze(1) / (D ** 0.5)
                 
+                # Incorporate encoder attention if available
                 if encoder_attn is not None and prev_node is not None: 
-                    # incorporate the encoder's attention into the calculation
-                    # attention is returned raw by the encoders, along with edge index, so we can actually use that fucker
-
                     for layer_attention in encoder_attn:
-                        
                         edge_idx, attn_wts = layer_attention
                         
                         if attn_wts.dim() > 1 and attn_wts.size(1) > 1:
                             attn_wts = attn_wts.mean(dim=1)
 
-
                         source_nodes = edge_idx[0]
-                        tgt_nodes    = edge_idx[1]
+                        tgt_nodes = edge_idx[1]
 
                         for b in range(B): 
-                            if prev_node is not None: 
+                            if prev_node is not None and not tour_complete[b]: 
                                 prev_idx = prev_node[b].item()
                                 mask_from_prev = (source_nodes == prev_idx)
 
                                 if mask_from_prev.any(): 
                                     targets = tgt_nodes[mask_from_prev]
-                                    edge_attn  = attn_wts[mask_from_prev]
+                                    edge_attn = attn_wts[mask_from_prev]
                                     
                                     for t, w in zip(targets, edge_attn):
                                         if t < N: 
                                             scores[b, t] += self.enc_attn_wt * w
-
-                # route enforcement checks 
+                
+                # Check for planned shortcuts for this step
+                has_shortcut = torch.zeros(B, dtype=torch.bool, device=device)
+                forced_nodes = torch.zeros(B, dtype=torch.long, device=device)
+                
                 for b in range(B):
-                    # Count unique visited nodes
-                    actual_n = real_nodes_count[b].item()
+                    # if this batch has a planned shortcut for this step
+                    if b in planned_shortcuts and planned_shortcuts[b][0] == step:
+                        # get the next node in the shortcut sequence
+                        next_shortcut_node = planned_shortcuts[b][1][0]
+                        forced_nodes[b] = next_shortcut_node
+                        has_shortcut[b] = True
+                        
+                        # update the shortcut plan
+                        remaining_nodes = planned_shortcuts[b][1][1:]
+                        if len(remaining_nodes) > 0:
+                            planned_shortcuts[b] = (step + 1, remaining_nodes)
+                        else:
+                            del planned_shortcuts[b]
+                
+                # dynamic shortcut detection
+                for b in range(B):
+                    if tour_complete[b] or has_shortcut[b]:
+                        continue
                     
-                    if unique_visited_count[b] < actual_n:
-                        # Still have unvisited nodes - penalize revisits
-                        # this is the part that ensures that all unique nodes form the graph are present
-                        revisit_mask = visited_nodes[b] & mask[b]
+                    # ensure all nodes are visited
+                    if unique_visited_count[b] < N:
+                        # revisit penalty to encourage covering all nodes first
+                        revisit_mask = visited_nodes[b]
                         scores[b].masked_fill_(revisit_mask, self.revisit_penalty)
                     else:
-                        # All nodes visited, consider shortcuts based on distance
+                        #all nodes visited - actively look for beneficial shortcuts
                         if edge_weights is not None and prev_node is not None:
                             prev_idx = prev_node[b].item()
-
-                            next_idx = first_node[b].item()
-
-                            if step < N-1 and len(tours) > step:
+                            
+                            next_idx = first_node[b].item()  
+                            
+                            # try to look ahead in the existing tour
+                            if step < len(tours) and step < N-1:
                                 next_idx = tours[step][b].item()
-
-                            #i.e. no shortcut cost                            
+                            
+                            # cost of direct path (similar to the shortcut optimization in the simulated annealing
+                            # part of the rust repo)
                             direct_cost = edge_weights[b, prev_idx, next_idx]
-
-                            for potential_idx in range(N):
-                                # don't consider nodes that aren't real
-                                if not mask[b, potential_idx]:
+                            
+                            # best possible shortcut
+                            best_savings = 0.0
+                            best_shortcut = None
+                            
+                            # check all potential intermediate nodes
+                            for mid_idx in range(N):
+                                if mid_idx == next_idx:
                                     continue
-                                # if the candidate is the same as direct index, skip
-                                if potential_idx == next_idx: 
-                                    continue
-
-                                detour_cost = edge_weights[b, prev_idx, potential_idx] + edge_weights[b, potential_idx, next_idx]
-                                if detour_cost < direct_cost: 
-                                    savings_ratio = (direct_cost - detour_cost) / direct_cost
-                                    scores[b, potential_idx] += self.shortcut_bonus * savings_ratio
-
-                            edge_costs = edge_weights[b, prev_idx]
-                            if edge_costs.max() > edge_costs.min(): 
-                                normd_costs = 1. - (edge_costs - edge_costs.min()) / (edge_costs.max() - edge_costs.min())
-                                scores[b] = scores[b] + self.shortcut_weight * normd_costs
-
-                # invalid node masking
-                scores = scores.masked_fill(~mask, -1e9)
+                                    
+                                via_mid = edge_weights[b, prev_idx, mid_idx] + \
+                                          edge_weights[b, mid_idx, next_idx]
                                 
-                # Get probabilities
+                                if via_mid < direct_cost:
+                                    savings = direct_cost - via_mid
+                                    if savings > best_savings:
+                                        best_savings = savings
+                                        best_shortcut = [mid_idx, next_idx]
+                            
+                            #good shortcut? plan it
+                            if best_shortcut is not None and best_savings > 0:
+                                planned_shortcuts[b] = (step, best_shortcut)
+                                forced_nodes[b] = best_shortcut[0]
+                                has_shortcut[b] = True
+                            else:
+                                # just add bonuses for individual nodes proportional to savings
+                                for potential_idx in range(N):
+                                    if potential_idx == next_idx:
+                                        continue
+                                    
+                                    detour_cost = edge_weights[b, prev_idx, potential_idx] + \
+                                                 edge_weights[b, potential_idx, next_idx]
+                                    
+                                    # if shortcut saves distance, add a bonus
+                                    if detour_cost < direct_cost:
+                                        savings_ratio = (direct_cost - detour_cost) / direct_cost
+                                        scores[b, potential_idx] += self.shortcut_bonus * savings_ratio
+                            
+                            # Also apply regular edge cost normalization
+                            edge_costs = edge_weights[b, prev_idx]
+                            if edge_costs.max() > edge_costs.min():
+                                normalized_costs = 1.0 - (edge_costs - edge_costs.min()) / (edge_costs.max() - edge_costs.min())
+                                scores[b] = scores[b] + self.shortcut_weight * normalized_costs
+                
+                # Apply forced nodes for shortcuts
+                for b in range(B):
+                    if has_shortcut[b]:
+                        # force selection of shortcut node by setting a very high score
+                        scores[b] = torch.full_like(scores[b], -1e9)
+                        scores[b, forced_nodes[b]] = 100.0
+                
+                # force return to start if tour is completed
+                for b in range(B):
+                    if tour_complete[b]:
+                        scores[b] = torch.full_like(scores[b], -1e9)
+                        scores[b, first_node[b]] = 100.0
+                
+                # get probabilities
                 probs = F.softmax(scores, dim=1)
                 
-                # Sample next node
-                if greedy:
-                    _, curr_node = probs.max(dim=1)
-                    #print(f"from greedy call: {curr_node}")
-                else:
-                    curr_node = torch.multinomial(probs, 1).squeeze(-1)
+                # Sample next node or use forced node
+                curr_node = torch.zeros(B, dtype=torch.long, device=device)
+                for b in range(B):
+                    if has_shortcut[b] or tour_complete[b]:
+                        if tour_complete[b]:
+                            curr_node[b] = first_node[b]
+                        else:
+                            curr_node[b] = forced_nodes[b]
+                    elif greedy:
+                        # greedy selection - used in inference adn updataes
+                        _, curr_node[b] = probs[b].max(dim=0)
+                    else:
+                        # sample from distribution - used in trainign
+                        curr_node[b] = torch.multinomial(probs[b], 1).item()
                 
-                # Get log probability
+                # log probability
                 curr_log_p = torch.log(torch.gather(probs, 1, curr_node.unsqueeze(1)).squeeze(1) + 1e-10)
                 
                 # Remember first selected node
@@ -343,22 +438,23 @@ class LSTMDecoder(nn.Module):
                     first_node = curr_node.clone()
             
             # Add current node to tour
-            tours.append(curr_node)
+            tours.append(curr_node.clone()) 
             log_probs.append(curr_log_p)
             
-            if step < N:
+            if step < max_steps:
                 # Update state for next step
-                # Create new tensor for visited nodes 
+                
+                # Create new tensor for visited nodes
                 new_visited = visited_nodes.clone()
                 
                 # For each batch item, mark current node as visited
                 for b in range(B):
-                    # If this is a new node, increment unique count
-                    if not new_visited[b, curr_node[b]]:
-                        unique_visited_count[b] += 1
-                    
-                    # Mark as visited
-                    new_visited[b, curr_node[b]] = True
+                    if not tour_complete[b]:
+                        # If this is a new node, increment unique count
+                        if not new_visited[b, curr_node[b]]:
+                            unique_visited_count[b] += 1
+                        
+                        new_visited[b, curr_node[b]] = True
                 
                 # Update visited nodes tensor
                 visited_nodes = new_visited
@@ -367,12 +463,15 @@ class LSTMDecoder(nn.Module):
                 inp = node_emb[torch.arange(B, device=device), curr_node]
                 
                 # Update previous node
-                prev_node = curr_node
+                prev_node = curr_node.clone()
+        
+        # stack and return results
         return torch.stack(tours, dim=1), torch.stack(log_probs, dim=1)
     
 class GraphResNet(nn.Module):
     """
     Simplified graph model for TSP
+    the name is a misnomer from earlier parts of writing this thing
     """
     def __init__(
             self,
@@ -390,20 +489,20 @@ class GraphResNet(nn.Module):
 
     def forward(self, batch_data, greedy=None): 
         # Get node embeddings and mask
-        node_emb, mask, encoder_attention = self.encoder(batch_data)
+        node_emb, _, encoder_attention = self.encoder(batch_data)
         
-        # Extract edge weights for distance-based decisions
+        # extract edge weights for distance-based decisions
         full_lookups = [sample[3] for sample in batch_data]
         B, N_max, _ = node_emb.size()
         batched_weights = torch.zeros(B, N_max, N_max, device=node_emb.device)
         
-        # Process each batch item
+        # process each batch item
         for i, lookup in enumerate(full_lookups):
             n = lookup.size(0)
             batched_weights[i, :n, :n] = lookup
         
-        # Use greedy decoding if specified
+        # use greedy decoding if specified
         use_greedy = greedy if greedy is not None else self.greedy
         
-        # Generate tour
-        return self.decoder(node_emb, mask, edge_weights=batched_weights,encoder_attn=encoder_attention, greedy=use_greedy)
+        # yeet out a tour
+        return self.decoder(node_emb, _, edge_weights=batched_weights,encoder_attn=encoder_attention, greedy=use_greedy)

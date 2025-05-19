@@ -2,39 +2,37 @@ import torch
 from dataset import TSPDataset
 from graph_net import GraphResNet
 from REINFORCE import REINFORCE
+from last_ditch_effort import TSPTransformer
 
 def main():
-    # Set random seed for reproducibility
     torch.manual_seed(42)
     torch.set_num_interop_threads(8)
     
-    # Parameters
-    num_samples = 100
-    min_nodes = 10      
-    max_nodes = 40  
+    num_samples = 1000
+    min_nodes = 20     
+    max_nodes = 20 # This is a leftover from when I was trying to make it train on variable graph sizes, 
+                   # the assert in EncodeArray is going to crash if this is not 20 
     
-    batch_size = 8 
-    num_epochs = 10      
+    batch_size = 32
+    num_epochs = 20      
     steps_per_epoch = 1000
-    lr = 1e-5
+    lr = 1e-4
     
-    # Create dataset
     print("Creating dataset...")
     dataset = TSPDataset(num_samples, min_nodes=min_nodes, max_nodes=max_nodes)
     
-    # Create model
     print("Creating model...")
 
     model = GraphResNet(
-        hidden_dims=[64], 
+        hidden_dims=[64],
         init_channels=8, 
-        heads=16, 
-        dropout=0., 
-        )
+        heads=16,
+        dropout=0.1
+    )
+
     print(model)
 
 
-    # Create trainer
     print("Setting up trainer...")
     trainer = REINFORCE(
         model=model,
@@ -45,7 +43,6 @@ def main():
         baseline_update_freq=1  
     )
     
-    # Train model
     print("Starting training...")
     trainer.train(dataset)
     

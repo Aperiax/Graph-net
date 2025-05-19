@@ -20,6 +20,7 @@ class REINFORCE:
             steps_per_epoch=2500,
             significance_level=0.1,
             baseline_update_freq=1,
+            revisit_bonus_factor=1.0,  
             device='cuda' if torch.cuda.is_available() else 'cpu'
         ):
         """
@@ -32,6 +33,7 @@ class REINFORCE:
             steps_per_epoch: Number of steps per epoch
             significance_level: Significance level for paired t-test when updating baseline
             baseline_update_freq: Frequency (in epochs) to check for baseline updates
+            revisit_bonus_factor: Scaling factor for revisit bonuses
             device: Device to train on
         """
         self.model = model.to(device)
@@ -46,12 +48,14 @@ class REINFORCE:
         self.steps_per_epoch = steps_per_epoch
         self.significance_level = significance_level
         self.baseline_update_freq = baseline_update_freq
+        self.revisit_bonus_factor = revisit_bonus_factor
         self.device = device
         
         # Statistics for tracking
         self.baseline_updates = 0
         self.train_losses = []
         self.eval_stats = []
+        self.revisit_stats = []  
 
     def _custom_collate_fn(self, batch): 
         # to sidestep DataLoader autostacking tensors
@@ -69,11 +73,9 @@ class REINFORCE:
             tour_b = tour[b]
             total_distance = 0.0
             
-            # Get number of unique nodes in the tour
             unique_nodes = torch.unique(tour_b).size(0)
             all_nodes = edge_lookup.size(0)
             
-            # Compute tour length
             for i in range(tour_b.size(0) - 1): 
                 src = tour_b[i]
                 tgt = tour_b[i+1]
@@ -82,24 +84,54 @@ class REINFORCE:
             # Complete the tour by returning to start
             total_distance += edge_lookup[tour_b[-1], tour_b[0]]
             
-            # Check if the tour visited all nodes
+            # check if all were visited
             if unique_nodes < all_nodes:
-                # Heavily penalize incomplete tours
+                # heavily penalize incomplete tours
                 total_distance += 100000 * (all_nodes - unique_nodes)
-
-            # so now what I'd like to implemetn is this - boolean flag returns for these occasions:             
-            # all nodes visited 
-            # benefitial revisits 
-            # if either is true, then I'll give it a nice ol' reward 
-
-
+            
             tour_lengths[b] = total_distance
     
         return tour_lengths
+    
+    def _compute_clean_tour_length(self, tour, batch_data_item):
+        """
+        Compute the length of a 'clean' tour that visits each node exactly once
+        """
+        edge_lookup = batch_data_item[3]
+        
+        # clean tour with no revisits
+        seen = set()
+        clean_tour = []
+        
+        for node in tour:
+            node_idx = node.item()
+            if node_idx not in seen:
+                clean_tour.append(node)
+                seen.add(node_idx)
+                
+        # Ensure we have at least one node
+        if not clean_tour:
+            return torch.tensor(float('inf'), device=self.device)
+            
+        clean_tour = torch.stack(clean_tour)
+        
+        # Add return to start
+
+        clean_tour = torch.cat([clean_tour, clean_tour[0:1]])
+        
+        # Compute clean tour length
+        total_distance = 0.0
+        for i in range(clean_tour.size(0) - 1):
+            src = clean_tour[i]
+            tgt = clean_tour[i+1]
+            total_distance += edge_lookup[src, tgt]
+            
+        return total_distance
 
     def _sample_solution(self, model, batch_data, greedy=False):
         """
         Sample a solution from the model
+        
         """
         if greedy:
             return model(batch_data, greedy=greedy)    
@@ -124,8 +156,6 @@ class REINFORCE:
         """
         Train the model using REINFORCE with rollout baseline
         
-        Args:
-            dataset: TSPDataset instance
         """
         train_dataloader = DataLoader(
             dataset, 
@@ -137,7 +167,10 @@ class REINFORCE:
         for epoch in range(self.num_epochs):
             self.model.train()
             epoch_loss = 0
-            tours=None
+            epoch_revisit_bonus_count = 0
+            epoch_revisit_count = 0
+            epoch_beneficial_revisit_count = 0
+            tours = None
             
             for batch_data in tqdm(train_dataloader, f"Training epoch: {epoch}", total=len(train_dataloader), dynamic_ncols=True, leave=True):
                 batch_data = [
@@ -150,35 +183,83 @@ class REINFORCE:
                 
                 tours, log_probs = self._sample_solution(self.model, batch_data, greedy=False)
                 baseline_tours, _ = self._sample_solution(self.baseline_model, batch_data, greedy=False)
-
+                
                 tour_lengths = self._compute_tour_length(tours, batch_data)
                 baseline_lengths = self._compute_tour_length(baseline_tours, batch_data)
                 
-                # Calculate advantage
-                # if the current model outputs longer length tensors, it's being punished
-                advantage = baseline_lengths - tour_lengths 
-                loss = torch.mean(-advantage * log_probs.sum(dim=1)) 
+                # Calculate base advantage
+                advantage = baseline_lengths - tour_lengths
+                
+                batch_revisit_count = 0
+                batch_beneficial_revisit_count = 0
+                
+                for b in range(len(batch_data)):
+                    # original node coutns
+                    edge_lookup = batch_data[b][3]
+                    all_nodes = edge_lookup.size(0)
+                    
+                    # count unique nodes in the tour
+                    tour_b = tours[b]
+                    unique_nodes = torch.unique(tour_b).size(0)
+                    
+                    # Are there revisits beyond the closing node?
+                    has_revisits = unique_nodes < all_nodes
+                    
+                    if has_revisits:
+                        batch_revisit_count += 1
+                        
+                        # wath the tour length would be without revisits
+                        clean_tour_length = self._compute_clean_tour_length(tour_b, batch_data[b])
+                        
+                        # if tour with revisits is better than clean tour
+                        if tour_lengths[b] < clean_tour_length:
+                            # how much better and apply bonus
+                            improvement = (clean_tour_length - tour_lengths[b]) / clean_tour_length
+                            bonus = improvement * self.revisit_bonus_factor
+                            
+                            # adding the revisit bonus
+                            advantage[b] = advantage[b] * (1.0 + bonus)
+                            
+                            epoch_revisit_bonus_count += 1
+                            batch_beneficial_revisit_count += 1
+                
+                epoch_revisit_count += batch_revisit_count
+                epoch_beneficial_revisit_count += batch_beneficial_revisit_count
+                
+                loss = torch.mean(-advantage * log_probs.sum(dim=1))
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                # this doesn't really influence the learning apart for making the gradients more stable, didn't really see a difference though
+                # this doesn't really influence the learning apart for making the gradients more stable
+                # or at least I didn't notice any change with or without it
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 
                 epoch_loss += loss.item()
 
-            # Average loss for the epoch
             avg_epoch_loss = epoch_loss / self.steps_per_epoch
             self.train_losses.append(avg_epoch_loss)
-            #torch.set_printoptions(threshold=float('inf'))
-            #print(tours) 
+            
+            revisit_rate = epoch_revisit_count / self.steps_per_epoch if self.steps_per_epoch > 0 else 0
+            beneficial_rate = epoch_beneficial_revisit_count / epoch_revisit_count if epoch_revisit_count > 0 else 0
+            
+            self.revisit_stats.append({
+                'epoch': epoch,
+                'revisit_rate': revisit_rate,
+                'beneficial_rate': beneficial_rate,
+                'bonus_applied_count': epoch_revisit_bonus_count
+            })
+            
             print(f"Epoch {epoch+1}/{self.num_epochs}, Loss: {avg_epoch_loss:.4f}")
+            print(f"Revisit rate: {revisit_rate:.2%}, Beneficial: {beneficial_rate:.2%}, Bonuses: {epoch_revisit_bonus_count}")
             print("Training complete") 
-            # Evaluation and baseline update (every baseline_update_freq epochs)
+
+            # trigger the update every update_freq epochs 
             if (epoch + 1) % self.baseline_update_freq == 0:
                 self._evaluate_and_update_baseline(dataset)
             if epoch % 5 == 0: 
                 torch.save(self.model, f"cpt_{epoch}.pt")
+        
         # once we're done, just save the baseline to be sure
         print("Saving the baseline model") 
         torch.save(self.baseline_model, "baseline.pt")   
@@ -186,25 +267,11 @@ class REINFORCE:
     def _analyze_tour(self, tour, edge_lookup):
         """
         Analyzes a tour for optimality and handling of revisits
-        ... though it doesn't work that well 
-        Args:
-        --- 
-            tour: Tensor containing node indices
-            edge_lookup: Edge lookup table
-            
-        Returns:
-        ---
-            dict: Statistics about the tour including:
-                - total_length: Total tour length
-                - unique_nodes: Number of unique nodes visited
-                - revisit_count: Number of revisits
-                - improved_by_revisit: Whether revisits improved the tour length
         """
         unique_nodes = torch.unique(tour).size(0)
         total_nodes = tour.size(0)
         revisit_count = total_nodes - unique_nodes
         
-        # Calculate the standard tour length (revisits in)
         total_distance = 0.0
         for i in range(len(tour) - 1):
             src = tour[i]
@@ -213,8 +280,6 @@ class REINFORCE:
                 
         total_distance += edge_lookup[tour[-1], tour[0]]
 
-        # Calculate what the tour length would be without revisits (visiting each unique node once)
-        # this is somehting i've found online, but to be honest I don't think I'm doing it right? 
         unique_tour = []
         for node in tour:
             if node.item() not in [n.item() for n in unique_tour]:
@@ -244,15 +309,10 @@ class REINFORCE:
     def _evaluate_and_update_baseline(self, dataset, num_eval_instances=100):
         """
         Evaluate current model and update baseline if significantly (alpha = 0.05) better
-        
-        Args:
-            dataset: Dataset to sample evaluation instances from
-            num_eval_instances: Number of instances to evaluate on
         """
         self.model.eval()
         self.baseline_model.eval()
         
-        # Create evaluation dataloader with fixed seed
         eval_dataset = torch.utils.data.Subset(
             dataset, 
             indices=torch.randperm(len(dataset))[:num_eval_instances]
@@ -275,33 +335,26 @@ class REINFORCE:
                     (coords.to(self.device), 
                      edge_index.to(self.device), 
                      edge_attr.to(self.device), 
-                     edge_lookup.to(self.device)) # before making this into tensor this caused so many problems
+                     edge_lookup.to(self.device))
                     for coords, edge_index, edge_attr, edge_lookup in batch_data
                 ]
 
                 # Get greedy solutions from both models
                 current_tours, _ = self._sample_solution(self.model, device_batch_data, greedy=True)
                 baseline_tours, _ = self._sample_solution(self.baseline_model, device_batch_data, greedy=True)
-                #print(f"baseline tours from eval_baseline: {baseline_tours}")
-                # Compute tour lengths
+                
                 c_lengths = self._compute_tour_length(current_tours, device_batch_data)
                 b_lengths = self._compute_tour_length(baseline_tours, device_batch_data)
-                #print(f"b_lengths: {b_lengths}") 
+                
                 current_lengths.append(c_lengths)
                 baseline_lengths.append(b_lengths)
         
-        # litearlly the average lenghts of the tour based on the adjacency 
-        # edge weights, which in my case represent the distances between individual cities
-
         current_lengths = torch.cat(current_lengths)
         baseline_lengths = torch.cat(baseline_lengths)
         
-        # Calculate statistics
         current_mean = current_lengths.mean().item()
         baseline_mean = baseline_lengths.mean().item()
-        #print(current_mean)
         improvement = (baseline_mean - current_mean) / baseline_mean * 100
-        #it crashes here
 
         sample_batch = next(iter(eval_dataloader))
 
@@ -338,7 +391,7 @@ class REINFORCE:
         print(f"Evaluation: Baseline model mean tour length: {baseline_mean:.4f}")
         print(f"Improvement: {improvement:.2f}%")
         
-        # Perform t-test and update baseline if current model is significantly better
+        # t-test and update if better
         if self._paired_t_test(current_lengths, baseline_lengths):
             print("Current model is significantly better. Updating baseline model.")
             self.baseline_model = deepcopy(self.model).to(self.device)
